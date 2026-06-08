@@ -1,0 +1,21 @@
+{
+  "name": "pi-remote-runtime",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Workspace-side runtime for remote Pi containers.",
+  "bin": {
+    "pi-remote-runtime": "bin/pi-remote-runtime.js"
+  },
+  "scripts": {
+    "start": "node bin/pi-remote-runtime.js",
+    "docker:build": "docker build -t tavonai/pi-remote-runtime:latest .",
+    "docker:push": "docker push tavonai/pi-remote-runtime:latest"
+  },
+  "dependencies": {
+    "ws": "^8.17.1"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "license": "MIT"
+}
