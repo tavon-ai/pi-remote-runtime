@@ -19,9 +19,24 @@ tavonai/pi-remote-runtime
 
 ## Build locally
 
+For a local-only test image:
+
 ```bash
 docker build -t tavonai/pi-remote-runtime:latest .
 ```
+
+## Build and push for Fly.io
+
+Fly/Depot may build workspace images on a different CPU architecture than your local machine. Push a multi-platform manifest so `FROM tavonai/pi-remote-runtime:latest` works from Fly builds:
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t tavonai/pi-remote-runtime:latest \
+  --push .
+```
+
+Do not use a plain `docker build` + `docker push` for the published `latest` image unless you intentionally want a single-platform manifest; Fly may fail with `no match for platform in manifest`.
 
 ## Run locally
 
@@ -45,11 +60,10 @@ ws://localhost:7777/rpc
 
 Use `Authorization: Bearer <PI_REMOTE_TOKEN>` when `PI_REMOTE_TOKEN` is set.
 
-## Push
+## Docker Hub login
 
 ```bash
 docker login --username tavonai
-docker push tavonai/pi-remote-runtime:latest
 ```
 
 ## Override the supervised command

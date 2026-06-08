@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 
 const http = require('node:http');
+const { createReadStream, existsSync, readdirSync, statSync } = require('node:fs');
+const { homedir } = require('node:os');
+const { join, resolve } = require('node:path');
+const { createInterface } = require('node:readline');
 const { spawn } = require('node:child_process');
 const { WebSocketServer } = require('ws');
 
@@ -49,8 +53,85 @@ function authorized(req) {
   return url.searchParams.get('token') === token;
 }
 
-const server = http.createServer((req, res) => {
-  if (req.url === '/health' || req.url === '/healthz') {
+function defaultSessionDir(cwd) {
+  const resolvedCwd = resolve(cwd);
+  const safePath = `--${resolvedCwd.replace(/^[\/\\]/, '').replace(/[\/\\:]/g, '-')}--`;
+  return join(process.env.HOME || homedir(), '.pi', 'agent', 'sessions', safePath);
+}
+
+function sessionDir() {
+  return process.env.PI_CODING_AGENT_SESSION_DIR || defaultSessionDir(process.env.WORKSPACE_DIR || process.cwd());
+}
+
+function textContent(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.filter((block) => block && block.type === 'text' && typeof block.text === 'string').map((block) => block.text).join(' ');
+}
+
+async function buildSessionInfo(filePath) {
+  const stats = statSync(filePath);
+  let header = null;
+  let name;
+  let messageCount = 0;
+  let firstMessage = '';
+  let lastActivityTime;
+
+  const rl = createInterface({ input: createReadStream(filePath, { encoding: 'utf8' }), crlfDelay: Infinity });
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    if (!header) {
+      if (entry.type !== 'session' || typeof entry.id !== 'string') return null;
+      header = entry;
+      continue;
+    }
+
+    if (entry.type === 'session_info') name = entry.name?.trim() || undefined;
+    if (entry.type !== 'message') continue;
+    messageCount += 1;
+
+    const message = entry.message;
+    if (!message || (message.role !== 'user' && message.role !== 'assistant')) continue;
+    const messageTime = typeof message.timestamp === 'number' ? message.timestamp : Date.parse(entry.timestamp);
+    if (!Number.isNaN(messageTime)) lastActivityTime = Math.max(lastActivityTime || 0, messageTime);
+    const text = textContent(message.content);
+    if (!firstMessage && message.role === 'user' && text) firstMessage = text;
+  }
+
+  if (!header) return null;
+  const headerTime = Date.parse(header.timestamp);
+  const modified = lastActivityTime ? new Date(lastActivityTime) : Number.isNaN(headerTime) ? stats.mtime : new Date(headerTime);
+  return {
+    id: header.id,
+    path: filePath,
+    name,
+    firstMessage: firstMessage || '(no messages)',
+    messageCount,
+    created: Number.isNaN(headerTime) ? stats.birthtime.toISOString() : new Date(headerTime).toISOString(),
+    modified: modified.toISOString(),
+  };
+}
+
+async function listSessions() {
+  const dir = sessionDir();
+  if (!existsSync(dir)) return [];
+  const files = readdirSync(dir).filter((file) => file.endsWith('.jsonl')).map((file) => join(dir, file));
+  const sessions = (await Promise.all(files.map((file) => buildSessionInfo(file).catch(() => null)))).filter(Boolean);
+  sessions.sort((a, b) => Date.parse(b.modified) - Date.parse(a.modified));
+  return sessions;
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+
+  if (url.pathname === '/health' || url.pathname === '/healthz') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, pi: childReady, lastExit }));
     return;
@@ -59,6 +140,17 @@ const server = http.createServer((req, res) => {
   if (!authorized(req)) {
     res.writeHead(401, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: 'unauthorized' }));
+    return;
+  }
+
+  if (url.pathname === '/sessions' && req.method === 'GET') {
+    try {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ sessions: await listSessions() }));
+    } catch (error) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'failed_to_list_sessions' }));
+    }
     return;
   }
 
