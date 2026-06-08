@@ -2,7 +2,7 @@
 
 const http = require('node:http');
 const { createReadStream, existsSync, readdirSync, statSync } = require('node:fs');
-const { homedir } = require('node:os');
+const { homedir, hostname } = require('node:os');
 const { join, resolve } = require('node:path');
 const { createInterface } = require('node:readline');
 const { spawn } = require('node:child_process');
@@ -59,8 +59,19 @@ function defaultSessionDir(cwd) {
   return join(process.env.HOME || homedir(), '.pi', 'agent', 'sessions', safePath);
 }
 
-function sessionDir() {
-  return process.env.PI_CODING_AGENT_SESSION_DIR || defaultSessionDir(process.env.WORKSPACE_DIR || process.cwd());
+function sessionRoots() {
+  if (process.env.PI_CODING_AGENT_SESSION_DIR) return [process.env.PI_CODING_AGENT_SESSION_DIR];
+  return [defaultSessionDir(process.env.WORKSPACE_DIR || process.cwd()), join(process.env.HOME || homedir(), '.pi', 'agent', 'sessions')];
+}
+
+function collectSessionFiles(root, recursive = false) {
+  if (!existsSync(root)) return [];
+  const entries = readdirSync(root, { withFileTypes: true });
+  return entries.flatMap((entry) => {
+    const path = join(root, entry.name);
+    if (entry.isDirectory() && recursive) return collectSessionFiles(path, true);
+    return entry.isFile() && entry.name.endsWith('.jsonl') ? [path] : [];
+  });
 }
 
 function textContent(content) {
@@ -119,13 +130,27 @@ async function buildSessionInfo(filePath) {
   };
 }
 
-async function listSessions() {
-  const dir = sessionDir();
-  if (!existsSync(dir)) return [];
-  const files = readdirSync(dir).filter((file) => file.endsWith('.jsonl')).map((file) => join(dir, file));
+async function listSessionsWithDiagnostics() {
+  const roots = sessionRoots();
+  const [cwdRoot, allRoot] = roots;
+  const files = [...new Set([...collectSessionFiles(cwdRoot), ...collectSessionFiles(allRoot, true)])];
   const sessions = (await Promise.all(files.map((file) => buildSessionInfo(file).catch(() => null)))).filter(Boolean);
   sessions.sort((a, b) => Date.parse(b.modified) - Date.parse(a.modified));
-  return sessions;
+  return {
+    sessions,
+    diagnostics: {
+      pid: process.pid,
+      hostname: hostname(),
+      cwd: process.cwd(),
+      workspaceDir: process.env.WORKSPACE_DIR || null,
+      home: process.env.HOME || homedir(),
+      piSessionDirEnv: process.env.PI_CODING_AGENT_SESSION_DIR || null,
+      roots,
+      files,
+      childReady,
+      lastExit,
+    },
+  };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -145,8 +170,9 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === '/sessions' && req.method === 'GET') {
     try {
+      const payload = await listSessionsWithDiagnostics();
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ sessions: await listSessions() }));
+      res.end(JSON.stringify(url.searchParams.get('debug') === '1' ? payload : { sessions: payload.sessions }));
     } catch (error) {
       res.writeHead(500, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'failed_to_list_sessions' }));
