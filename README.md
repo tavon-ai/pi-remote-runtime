@@ -60,6 +60,36 @@ ws://localhost:7777/rpc
 
 Use `Authorization: Bearer <PI_REMOTE_TOKEN>` when `PI_REMOTE_TOKEN` is set.
 
+## Subscription provider credentials
+
+Pi-to-Go injects Pi-compatible OAuth credentials as base64 JSON. The runtime decodes them before starting Pi:
+
+```bash
+PI_CODING_AGENT_DIR=/workspace/.pi-agent
+PI_AGENT_AUTH_JSON_BASE64=$(printf '%s' '{"openai-codex":{"type":"oauth","access":"...","refresh":"...","expires":1790000000000,"accountId":"..."}}' | base64)
+PI_REMOTE_RUNTIME_ARGS='--provider openai-codex --model gpt-5.5'
+```
+
+At startup, the runtime writes:
+
+```text
+$PI_CODING_AGENT_DIR/auth.json
+```
+
+with mode `0600`, then starts Pi with the selected provider/model arguments.
+
+Accepted auth env aliases:
+
+- `PI_AGENT_AUTH_JSON_BASE64`
+- `PI_AUTH_JSON_BASE64`
+- `PI_REMOTE_AUTH_JSON_BASE64`
+
+Accepted Pi argument env aliases, in priority order:
+
+- `PI_REMOTE_RUNTIME_ARGS`
+- `PI_CLI_ARGS`
+- `PI_ARGS`
+
 ## Docker Hub login
 
 ```bash

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const http = require('node:http');
-const { createReadStream, existsSync, readdirSync, statSync } = require('node:fs');
+const { chmodSync, createReadStream, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } = require('node:fs');
 const { homedir, hostname } = require('node:os');
 const { join, resolve } = require('node:path');
 const { createInterface } = require('node:readline');
@@ -28,9 +28,96 @@ let child;
 let childReady = false;
 let lastExit = null;
 
+function shellSplit(value) {
+  const result = [];
+  let current = '';
+  let quote = null;
+  let escaping = false;
+
+  for (const char of value) {
+    if (escaping) {
+      current += char;
+      escaping = false;
+      continue;
+    }
+
+    if (char === '\\') {
+      escaping = true;
+      continue;
+    }
+
+    if (quote) {
+      if (char === quote) quote = null;
+      else current += char;
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      if (current) {
+        result.push(current);
+        current = '';
+      }
+      continue;
+    }
+
+    current += char;
+  }
+
+  if (escaping) current += '\\';
+  if (current) result.push(current);
+  return result;
+}
+
+function piExtraArgs() {
+  const raw = process.env.PI_REMOTE_RUNTIME_ARGS || process.env.PI_CLI_ARGS || process.env.PI_ARGS || '';
+  return raw.trim() ? shellSplit(raw) : [];
+}
+
+function commandWithRuntimeSelection() {
+  const [cmd, ...cmdArgs] = commandArgs;
+  const extraArgs = piExtraArgs();
+
+  if (!extraArgs.length || !cmd || !/(^|\/)pi$/.test(cmd)) {
+    return [cmd, ...cmdArgs];
+  }
+
+  return [cmd, ...cmdArgs, ...extraArgs];
+}
+
+function authJsonBase64() {
+  return process.env.PI_AGENT_AUTH_JSON_BASE64 || process.env.PI_AUTH_JSON_BASE64 || process.env.PI_REMOTE_AUTH_JSON_BASE64 || '';
+}
+
+function preparePiAuth() {
+  const agentDir = process.env.PI_CODING_AGENT_DIR || '/workspace/.pi-agent';
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+
+  const encoded = authJsonBase64().trim();
+  if (!encoded) return;
+
+  const authPath = join(agentDir, 'auth.json');
+  const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+
+  // Validate before writing so an invalid secret fails loudly instead of making
+  // Pi report a misleading missing-provider error.
+  JSON.parse(decoded);
+
+  mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  writeFileSync(authPath, decoded, { encoding: 'utf8', mode: 0o600 });
+  chmodSync(agentDir, 0o700);
+  chmodSync(authPath, 0o600);
+}
+
 function startPi() {
   if (child) return child;
-  const [cmd, ...cmdArgs] = commandArgs;
+  preparePiAuth();
+  const [cmd, ...cmdArgs] = commandWithRuntimeSelection();
+  console.log(`starting Pi RPC: ${[cmd, ...cmdArgs].join(' ')}`);
   child = spawn(cmd, cmdArgs, {
     cwd: process.env.WORKSPACE_DIR || process.cwd(),
     env: process.env,
@@ -149,6 +236,9 @@ async function listSessionsWithDiagnostics() {
       files,
       childReady,
       lastExit,
+      piCodingAgentDir: process.env.PI_CODING_AGENT_DIR || null,
+      authJsonConfigured: Boolean(authJsonBase64().trim()),
+      piExtraArgs: piExtraArgs(),
     },
   };
 }
