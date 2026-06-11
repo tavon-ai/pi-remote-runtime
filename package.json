@@ -1,8 +1,8 @@
 {
   "name": "pi-remote-runtime",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
-  "description": "Workspace-side runtime for remote Pi containers.",
+  "description": "Workspace-side runtime supervisor for remote Pi containers: auth, health, and HTTP reverse proxy to pi-bridge.",
   "bin": {
     "pi-remote-runtime": "bin/pi-remote-runtime.js"
   },
@@ -10,9 +10,6 @@
     "start": "node bin/pi-remote-runtime.js",
     "docker:build": "docker build -t tavonai/pi-remote-runtime:latest .",
     "docker:push": "docker push tavonai/pi-remote-runtime:latest"
-  },
-  "dependencies": {
-    "ws": "^8.17.1"
   },
   "engines": {
     "node": ">=22.19.0"

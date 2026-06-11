@@ -6,12 +6,11 @@ const { homedir, hostname } = require('node:os');
 const { join, resolve } = require('node:path');
 const { createInterface } = require('node:readline');
 const { spawn } = require('node:child_process');
-const { WebSocketServer } = require('ws');
 
 const args = process.argv.slice(2);
 const separatorIndex = args.indexOf('--');
 const runtimeArgs = separatorIndex === -1 ? args : args.slice(0, separatorIndex);
-const commandArgs = separatorIndex === -1 ? ['pi', '--mode', 'rpc'] : args.slice(separatorIndex + 1);
+const commandArgs = separatorIndex === -1 ? [] : args.slice(separatorIndex + 1);
 
 function option(name, fallback) {
   const index = runtimeArgs.indexOf(name);
@@ -22,11 +21,15 @@ function option(name, fallback) {
 
 const host = option('--host', process.env.HOST || '0.0.0.0');
 const port = Number(option('--port', process.env.PORT || '7777'));
+const bridgePort = Number(option('--bridge-port', process.env.PI_BRIDGE_PORT || '7788'));
 const token = process.env.PI_REMOTE_TOKEN;
 
 let child;
 let childReady = false;
 let lastExit = null;
+let restartTimer = null;
+let restartDelayMs = 1000;
+let shuttingDown = false;
 
 function shellSplit(value) {
   const result = [];
@@ -73,20 +76,18 @@ function shellSplit(value) {
   return result;
 }
 
-function piExtraArgs() {
+function bridgeExtraArgs() {
   const raw = process.env.PI_REMOTE_RUNTIME_ARGS || process.env.PI_CLI_ARGS || process.env.PI_ARGS || '';
   return raw.trim() ? shellSplit(raw) : [];
 }
 
-function commandWithRuntimeSelection() {
-  const [cmd, ...cmdArgs] = commandArgs;
-  const extraArgs = piExtraArgs();
-
-  if (!extraArgs.length || !cmd || !/(^|\/)pi$/.test(cmd)) {
+function bridgeCommand() {
+  if (commandArgs.length) {
+    const [cmd, ...cmdArgs] = commandArgs;
+    if (/(^|\/)pi-bridge$/.test(cmd)) return [cmd, ...cmdArgs, ...bridgeExtraArgs()];
     return [cmd, ...cmdArgs];
   }
-
-  return [cmd, ...cmdArgs, ...extraArgs];
+  return ['pi-bridge', '--host', '127.0.0.1', '--port', String(bridgePort), ...bridgeExtraArgs()];
 }
 
 function authJsonBase64() {
@@ -113,23 +114,36 @@ function preparePiAuth() {
   chmodSync(authPath, 0o600);
 }
 
-function startPi() {
-  if (child) return child;
+function startBridge() {
+  if (child || shuttingDown) return;
   preparePiAuth();
-  const [cmd, ...cmdArgs] = commandWithRuntimeSelection();
-  console.log(`starting Pi RPC: ${[cmd, ...cmdArgs].join(' ')}`);
+  const [cmd, ...cmdArgs] = bridgeCommand();
+  console.log(`starting pi bridge: ${[cmd, ...cmdArgs].join(' ')}`);
   child = spawn(cmd, cmdArgs, {
     cwd: process.env.WORKSPACE_DIR || process.cwd(),
     env: process.env,
-    stdio: ['pipe', 'pipe', 'inherit'],
+    stdio: ['ignore', 'inherit', 'inherit'],
   });
   childReady = true;
+  child.on('error', (error) => {
+    console.error(`pi bridge failed to start: ${error.message}`);
+  });
   child.on('exit', (code, signal) => {
     lastExit = { code, signal, at: new Date().toISOString() };
     childReady = false;
     child = undefined;
+    if (shuttingDown) return;
+    console.error(`pi bridge exited (code=${code} signal=${signal}); restarting in ${restartDelayMs}ms`);
+    restartTimer = setTimeout(() => {
+      restartTimer = null;
+      startBridge();
+    }, restartDelayMs);
+    restartDelayMs = Math.min(restartDelayMs * 2, 30_000);
   });
-  return child;
+  // Reset backoff once the bridge stays up for a while.
+  setTimeout(() => {
+    if (childReady) restartDelayMs = 1000;
+  }, 60_000).unref();
 }
 
 function authorized(req) {
@@ -148,7 +162,11 @@ function defaultSessionDir(cwd) {
 
 function sessionRoots() {
   if (process.env.PI_CODING_AGENT_SESSION_DIR) return [process.env.PI_CODING_AGENT_SESSION_DIR];
-  return [defaultSessionDir(process.env.WORKSPACE_DIR || process.cwd()), join(process.env.HOME || homedir(), '.pi', 'agent', 'sessions')];
+  const roots = [defaultSessionDir(process.env.WORKSPACE_DIR || process.cwd()), join(process.env.HOME || homedir(), '.pi', 'agent', 'sessions')];
+  // PI_CODING_AGENT_DIR moves the whole agent dir (including sessions);
+  // pi-bridge writes its chat session files there.
+  if (process.env.PI_CODING_AGENT_DIR) roots.push(join(process.env.PI_CODING_AGENT_DIR, 'sessions'));
+  return roots;
 }
 
 function collectSessionFiles(root, recursive = false) {
@@ -219,8 +237,11 @@ async function buildSessionInfo(filePath) {
 
 async function listSessionsWithDiagnostics() {
   const roots = sessionRoots();
-  const [cwdRoot, allRoot] = roots;
-  const files = [...new Set([...collectSessionFiles(cwdRoot), ...collectSessionFiles(allRoot, true)])];
+  const [cwdRoot, ...recursiveRoots] = roots;
+  const files = [...new Set([
+    ...collectSessionFiles(cwdRoot),
+    ...recursiveRoots.flatMap((root) => collectSessionFiles(root, true)),
+  ])];
   const sessions = (await Promise.all(files.map((file) => buildSessionInfo(file).catch(() => null)))).filter(Boolean);
   sessions.sort((a, b) => Date.parse(b.modified) - Date.parse(a.modified));
   return {
@@ -238,9 +259,44 @@ async function listSessionsWithDiagnostics() {
       lastExit,
       piCodingAgentDir: process.env.PI_CODING_AGENT_DIR || null,
       authJsonConfigured: Boolean(authJsonBase64().trim()),
-      piExtraArgs: piExtraArgs(),
+      bridgeCommand: bridgeCommand(),
+      bridgePort,
     },
   };
+}
+
+// Streams the request to the local bridge and the response back, propagating
+// client aborts so the bridge can cancel the underlying Pi prompt.
+function proxyToBridge(req, res) {
+  const upstream = http.request(
+    {
+      host: '127.0.0.1',
+      port: bridgePort,
+      method: req.method,
+      path: req.url,
+      headers: { ...req.headers, host: `127.0.0.1:${bridgePort}` },
+    },
+    (upstreamRes) => {
+      res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
+      upstreamRes.pipe(res);
+    },
+  );
+
+  upstream.on('error', (error) => {
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    const unavailable = error.code === 'ECONNREFUSED' || error.code === 'ECONNRESET';
+    res.writeHead(unavailable ? 503 : 502, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: unavailable ? 'bridge_unavailable' : 'bridge_error', detail: error.message }));
+  });
+
+  res.on('close', () => {
+    upstream.destroy();
+  });
+
+  req.pipe(upstream);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -270,29 +326,21 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  res.writeHead(404, { 'content-type': 'application/json' });
-  res.end(JSON.stringify({ error: 'not_found' }));
+  proxyToBridge(req, res);
 });
 
-const wss = new WebSocketServer({ server, path: '/rpc' });
-wss.on('connection', (socket, req) => {
-  if (!authorized(req)) {
-    socket.close(1008, 'unauthorized');
-    return;
-  }
+function shutdown(signal) {
+  shuttingDown = true;
+  if (restartTimer) clearTimeout(restartTimer);
+  if (child) child.kill(signal);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000).unref();
+}
 
-  const pi = startPi();
-  const onData = (chunk) => socket.send(chunk.toString());
-  pi.stdout.on('data', onData);
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
-  socket.on('message', (message) => {
-    if (pi.stdin.writable) pi.stdin.write(message);
-    if (pi.stdin.writable) pi.stdin.write('\n');
-  });
-  socket.on('close', () => pi.stdout.off('data', onData));
-});
-
-startPi();
+startBridge();
 server.listen(port, host, () => {
-  console.log(`pi-remote-runtime listening on ${host}:${port}`);
+  console.log(`pi-remote-runtime listening on ${host}:${port} (bridge on 127.0.0.1:${bridgePort})`);
 });
